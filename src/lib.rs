@@ -1,18 +1,11 @@
-struct Emulator {
-    memory: [u8; 4096],      // оперативная память
-    v: [u8; 16],             // регистры общего назначения
-    i: u16,                  // индексный регистр
-    pc: u16,                 // счетчик команд (0x200)
-    stack: [u16; 16],        // стек вызовов
-    sp: u8,                  // указатель стека
-    dt: u8,                  // таймер задержки
-    st: u8,                  // таймер звука
-    screen: [bool; 64 * 32], // видеобуфер
-    keypad: [bool; 16],      // состояние 16 клавиш
-}
+mod stack;
 
-const SCREEN_WIDTH: usize = 64;
-const SCREEN_HEIGHT: usize = 32;
+use stack::Stack;
+
+const IS_SUPER_CHIP: bool = true;
+
+const SCREEN_WIDTH: usize = if IS_SUPER_CHIP { 128 } else { 64 };
+const SCREEN_HEIGHT: usize = if IS_SUPER_CHIP { 64 } else { 32 };
 
 // адрес, с которого начинается программа (512)
 const START_ADDR: u16 = 0x200;
@@ -37,6 +30,18 @@ const FONTSET: [u8; FONTSET_SIZE] = [
     0xF0, 0x80, 0xF0, 0x80, 0x80, // F
 ];
 
+struct Emulator {
+    memory: [u8; 4096],                           // оперативная память
+    v: [u8; 16],                                  // регистры общего назначения
+    i: u16,                                       // индексный регистр
+    pc: u16,                                      // счетчик команд (0x200)
+    stack: Stack,                                 // стек вызовов
+    dt: u8,                                       // таймер задержки
+    st: u8,                                       // таймер звука
+    screen: [bool; SCREEN_WIDTH * SCREEN_HEIGHT], // видеобуфер
+    keypad: [bool; 16],                           // состояние 16 клавиш
+}
+
 impl Emulator {
     pub fn new() -> Self {
         let mut em = Self {
@@ -44,8 +49,7 @@ impl Emulator {
             v: [0; 16],
             i: 0,
             pc: START_ADDR,
-            stack: [0; 16],
-            sp: 0,
+            stack: Stack::new(),
             dt: 0,
             st: 0,
             screen: [false; SCREEN_WIDTH * SCREEN_HEIGHT],
@@ -104,6 +108,54 @@ impl Emulator {
                 self.pc = nnn;
             }
 
+            // 2NNN: вызов подпрограммы (Call)
+            (2, _, _, _) => {
+                let nnn = op & 0x0FFF;
+                self.stack.push(self.pc);
+                self.pc = nnn;
+            }
+
+            // 00EE: возврат из подпрограммы (Return)
+            (0, 0, 0xE, 0xE) => {
+                self.pc = self.stack.pop();
+            }
+
+            // 3XNN: условный пропуск следующей команды
+            (3, _, _, _) => {
+                let x = digit2 as usize;
+                let nn = (op & 0x00FF) as u8;
+                if self.v[x] == nn {
+                    self.pc += 2;
+                }
+            }
+
+            // 4XNN: условный пропуск следующей команды
+            (4, _, _, _) => {
+                let x = digit2 as usize;
+                let nn = (op & 0x00FF) as u8;
+                if self.v[x] != nn {
+                    self.pc += 2;
+                }
+            }
+
+            // 5XY0: условный пропуск следующей команды
+            (5, _, _, 0) => {
+                let x = digit2 as usize;
+                let y = digit3 as usize;
+                if self.v[x] == self.v[y] {
+                    self.pc += 2;
+                }
+            }
+
+            // 9XY0: условный пропуск следующей команды
+            (9, _, _, 0) => {
+                let x = digit2 as usize;
+                let y = digit3 as usize;
+                if self.v[x] != self.v[y] {
+                    self.pc += 2;
+                }
+            }
+
             // 6XNN - LD Vx, byte: записать число NN в регистр VX
             (6, _, _, _) => {
                 let x = digit2 as usize;
@@ -118,15 +170,267 @@ impl Emulator {
                 self.v[x] = self.v[x].wrapping_add(nn);
             }
 
+            // 8XY0 - Set
+            (8, _, _, 0) => {
+                let x = digit2 as usize;
+                let y = digit3 as usize;
+                self.v[x] = self.v[y];
+            }
+
+            // 8XY1 - Binary OR
+            (8, _, _, 1) => {
+                let x = digit2 as usize;
+                let y = digit3 as usize;
+                self.v[x] = self.v[x] | self.v[y];
+            }
+
+            // 8XY2 - Binary AND
+            (8, _, _, 2) => {
+                let x = digit2 as usize;
+                let y = digit3 as usize;
+                self.v[x] = self.v[x] & self.v[y];
+            }
+
+            // 8XY3 - Logical XOR
+            (8, _, _, 3) => {
+                let x = digit2 as usize;
+                let y = digit3 as usize;
+                self.v[x] = ((self.v[x] != 0) ^ (self.v[y] != 0)) as u8;
+            }
+
+            // 8XY4 - Add
+            (8, _, _, 4) => {
+                let x = digit2 as usize;
+                let y = digit3 as usize;
+                let (sum, overflow) = self.v[x].overflowing_add(self.v[y]);
+                self.v[x] = sum;
+                self.v[0xF] = if overflow { 1 } else { 0 };
+            }
+
+            // 8XY5 - Subtract: VX = VX - VY
+            (8, _, _, 5) => {
+                let x = digit2 as usize;
+                let y = digit3 as usize;
+                let (diff, borrow) = self.v[x].overflowing_sub(self.v[y]);
+                self.v[x] = diff;
+                self.v[0xF] = if borrow { 0 } else { 1 };
+            }
+
+            // 8XY7 - Subtract: VX = VY - VX
+            (8, _, _, 7) => {
+                let x = digit2 as usize;
+                let y = digit3 as usize;
+                let (diff, borrow) = self.v[y].overflowing_sub(self.v[x]);
+                self.v[x] = diff;
+                self.v[0xF] = if borrow { 0 } else { 1 };
+            }
+
+            // 8XY6 - Shift to the right (SHR)
+            (8, _, _, 6) => {
+                let x = digit2 as usize;
+                let y = digit3 as usize;
+
+                // original CHIP-8
+                if !IS_SUPER_CHIP {
+                    self.v[x] = self.v[y];
+                }
+                let lsb = self.v[x] & 0x1; // младший (самый правый) бит
+                self.v[x] >>= 1; // сдвиг вправо на 1 бит
+                self.v[0xF] = lsb;
+            }
+
+            // 8XYE - Shift to the right (SHL)
+            (8, _, _, 0xE) => {
+                let x = digit2 as usize;
+                let y = digit3 as usize;
+
+                // original CHIP-8
+                if !IS_SUPER_CHIP {
+                    self.v[x] = self.v[y];
+                }
+                let msb = (self.v[x] & 0x80) >> 7; // старший бит и сдвигаем его в младший разряд
+                self.v[x] <<= 1; // сдвиг влево на 1 бит
+                self.v[0xF] = msb;
+            }
+
             // ANNN - LD I, addr: записать адрес NNN в индексный регистр I
             (0xA, _, _, _) => {
                 let nnn = op & 0x0FFF;
                 self.i = nnn;
             }
 
+            // BNNN and BXNN for SUPER_CHIP: прыжок со смещением
+            (0xB, _, _, _) => {
+                let nnn = op & 0x0FFF;
+                if IS_SUPER_CHIP {
+                    let x = digit2 as usize;
+                    self.pc = nnn + self.v[x] as u16;
+                } else {
+                    self.pc = nnn + self.v[0] as u16;
+                }
+            }
+
+            // CXNN - Random
+            (0xC, _, _, _) => {
+                let x = digit2 as usize;
+                let nn = (op & 0x00FF) as u8;
+                let random_byte: u8 = rand::random();
+                self.v[x] = random_byte & nn;
+            }
+
             // DXYN - DRW Vx, Vy, nibble: отрисовка спрайта
             (0xD, _, _, _) => {
-                todo!()
+                let n = (op & 0x000F) as u8;
+                let x = digit2 as usize;
+                let y = digit3 as usize;
+
+                // начальные координаты заворачиваются по размеру экрана
+                let start_x = self.v[x] % SCREEN_WIDTH as u8;
+                let start_y = self.v[y] % SCREEN_HEIGHT as u8;
+
+                // сброс флага коллизий перед отрисовкой
+                self.v[0xF] = 0;
+
+                // проходим по каждой строке спрайта
+                for row in 0..n {
+                    let screen_y = start_y + row;
+                    // прекращаем рисовать если вышли за нижнюю границу экрана
+                    if screen_y >= SCREEN_HEIGHT as u8 {
+                        break;
+                    }
+
+                    // читаем байт строки спрайта из памяти по адресу I + row
+                    let sprite_byte = self.memory[(self.i as usize) + row as usize];
+
+                    // проходим по всем 8 битам в строке слева направо
+                    for col in 0..8 {
+                        let screen_x = start_x + col;
+
+                        // прекращаем рисовать если вышли за правую границу экрана
+                        if screen_x >= SCREEN_WIDTH as u8 {
+                            break;
+                        }
+
+                        // проверяем конкретный бит (от 7го к 0му)
+                        // маска 0x80 (1000_0000) сдвигает вправо на col
+                        let sprite_pixel = (sprite_byte & (0x80 >> col)) != 0;
+
+                        // рисуем если пиксель спрайта равен 1
+                        if sprite_pixel {
+                            let idx = screen_y * SCREEN_WIDTH as u8 + screen_x;
+
+                            // если пиксель уже был включен, фиксируем столкновение
+                            if self.screen[idx as usize] {
+                                self.v[0xF] = 1;
+                            }
+
+                            // инвертируем пиксель на экране (XOR)
+                            self.screen[idx as usize] ^= true;
+                        }
+                    }
+                }
+            }
+
+            // EX9E - Skip if key (SKP Vx)
+            (0xE, _, 9, 0xE) => {
+                let x = digit2 as usize;
+                let key = (self.v[x] & 0x0F) as usize; // номер клавиши из регистра Vx
+                if self.keypad[key] {
+                    // если клавиша нажата
+                    self.pc += 2;
+                }
+            }
+
+            // EXA1 - Skip if !key (SKNP Vx)
+            (0xE, _, 0xA, 1) => {
+                let x = digit2 as usize;
+                let key = (self.v[x] & 0x0F) as usize; // номер клавиши из регистра Vx
+                if !self.keypad[key] {
+                    // если клавиша не нажата
+                    self.pc += 2;
+                }
+            }
+
+            // FX07 - Timer: sets Vx to the value of the delay timer (dt)
+            (0xF, _, 0, 7) => {
+                let x = digit2 as usize;
+                self.v[x] = self.dt;
+            }
+
+            // FX15 - Timer: sets the delay timer (dt) to the value in Vx
+            (0xF, _, 1, 5) => {
+                let x = digit2 as usize;
+                self.dt = self.v[x];
+            }
+
+            // FX18 - Timer: sets the sound timer (st) to the value in Vx
+            (0xF, _, 1, 8) => {
+                let x = digit2 as usize;
+                self.st = self.v[x];
+            }
+
+            // FX1E - Add to index
+            (0xF, _, 1, 0xE) => {
+                let x = digit2 as usize;
+                self.i = self.v[x] as u16;
+            }
+
+            // FX0A - Get key
+            (0xF, _, 0, 0xA) => {
+                let x = digit2 as usize;
+                let mut key_pressed = false;
+
+                for (key_index, &is_down) in self.keypad.iter().enumerate() {
+                    if is_down {
+                        self.v[x] = key_index as u8;
+                        key_pressed = true;
+                        break;
+                    }
+                }
+
+                if !key_pressed {
+                    self.pc -= 2;
+                }
+            }
+
+            // FX29 - Font Char
+            (0xF, _, 2, 9) => {
+                let x = digit2 as usize;
+                let digit = self.v[x] & 0x0F;
+                self.i = (0x000 + digit * 5) as u16;
+            }
+
+            // FX33: сохранить BCD-представление Vx в память по адресам I, I+1, I+2
+            (0xF, _, 3, 3) => {
+                let x = digit2 as usize;
+                let value = self.v[x];
+                let i = self.i as usize;
+
+                self.memory[i] = value / 100;
+                self.memory[i + 1] = (value / 10) % 10;
+                self.memory[i + 2] = value % 10;
+            }
+
+            // FX55: store registers to memory
+            (0xF, _, 5, 5) => {
+                let x = digit2 as usize;
+                let i = self.i as usize;
+                self.memory[i..=i + x].copy_from_slice(&self.v[0..=x]);
+
+                if !IS_SUPER_CHIP {
+                    self.i += (x as u16) + 1;
+                }
+            }
+
+            // FX65: load registers from memory
+            (0xF, _, 6, 5) => {
+                let x = digit2 as usize;
+                let i = self.i as usize;
+                self.v[0..=x].copy_from_slice(&self.memory[i..=i + x]);
+
+                if !IS_SUPER_CHIP {
+                    self.i += (x as u16) + 1;
+                }
             }
 
             _ => unimplemented!("Неизвестный опкод: {:#06x}", op),
@@ -165,5 +469,13 @@ mod tests {
 
         em.tick();
         assert_eq!(em.pc, 0x200)
+    }
+
+    #[test]
+    fn test_cxnn() {
+        let mut em = Emulator::new();
+
+        em.execute(0xC00F);
+        assert!(em.v[0] <= 0x0F);
     }
 }
