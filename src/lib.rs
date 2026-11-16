@@ -4,8 +4,8 @@ use stack::Stack;
 
 const IS_SUPER_CHIP: bool = true;
 
-const SCREEN_WIDTH: usize = if IS_SUPER_CHIP { 128 } else { 64 };
-const SCREEN_HEIGHT: usize = if IS_SUPER_CHIP { 64 } else { 32 };
+pub const SCREEN_WIDTH: usize = if IS_SUPER_CHIP { 128 } else { 64 };
+pub const SCREEN_HEIGHT: usize = if IS_SUPER_CHIP { 64 } else { 32 };
 
 // адрес, с которого начинается программа (512)
 const START_ADDR: u16 = 0x200;
@@ -30,7 +30,7 @@ const FONTSET: [u8; FONTSET_SIZE] = [
     0xF0, 0x80, 0xF0, 0x80, 0x80, // F
 ];
 
-struct Emulator {
+pub struct Emulator {
     memory: [u8; 4096],                           // оперативная память
     v: [u8; 16],                                  // регистры общего назначения
     i: u16,                                       // индексный регистр
@@ -198,7 +198,7 @@ impl Emulator {
                 self.v[x] = ((self.v[x] != 0) ^ (self.v[y] != 0)) as u8;
             }
 
-            // 8XY4 - Add
+            // 8XY4 - Add: VX = VX + VY
             (8, _, _, 4) => {
                 let x = digit2 as usize;
                 let y = digit3 as usize;
@@ -317,15 +317,15 @@ impl Emulator {
 
                         // рисуем если пиксель спрайта равен 1
                         if sprite_pixel {
-                            let idx = screen_y * SCREEN_WIDTH as u8 + screen_x;
+                            let idx = (screen_y as usize) * SCREEN_WIDTH + (screen_x as usize);
 
                             // если пиксель уже был включен, фиксируем столкновение
-                            if self.screen[idx as usize] {
+                            if self.screen[idx] {
                                 self.v[0xF] = 1;
                             }
 
                             // инвертируем пиксель на экране (XOR)
-                            self.screen[idx as usize] ^= true;
+                            self.screen[idx] ^= true;
                         }
                     }
                 }
@@ -437,16 +437,30 @@ impl Emulator {
         }
     }
 
+    // управление временем
     pub fn tick_timers(&mut self) {
         if self.dt > 0 {
             self.dt -= 1;
         }
         if self.st > 0 {
-            if self.st == 1 {
-                // todo
-            }
             self.st -= 1;
         }
+    }
+
+    // отдача картинки
+    pub fn get_display(&self) -> &[bool] {
+        &self.screen
+    }
+
+    // прием нажатий
+    pub fn keypress(&mut self, idx: usize, pressed: bool) {
+        if idx < 16 {
+            self.keypad[idx] = pressed;
+        }
+    }
+
+    pub fn is_sound_playing(&self) -> bool {
+        self.st > 0
     }
 }
 
@@ -454,12 +468,17 @@ impl Emulator {
 mod tests {
     use super::*;
 
+    fn setup_emulator(opcodes: &[u16]) -> Emulator {
+        let mut em = Emulator::new();
+        let rom: Vec<u8> = opcodes.iter().flat_map(|op| op.to_be_bytes()).collect();
+        em.load_rom(&rom);
+        em
+    }
+
     #[test]
     fn test_basic_opcodes() {
-        let mut em = Emulator::new();
         // Программа: 610A (V1 = 10), 7105 (V1 +=5), 1200 (обратно на 0x200)
-        let rom = [0x61, 0x0A, 0x71, 0x05, 0x12, 0x00];
-        em.load_rom(&rom);
+        let mut em = setup_emulator(&[0x610A, 0x7105, 0x1200]);
 
         em.tick();
         assert_eq!(em.v[1], 10);
@@ -468,7 +487,7 @@ mod tests {
         assert_eq!(em.v[1], 15);
 
         em.tick();
-        assert_eq!(em.pc, 0x200)
+        assert_eq!(em.pc, 0x200);
     }
 
     #[test]
@@ -477,5 +496,139 @@ mod tests {
 
         em.execute(0xC00F);
         assert!(em.v[0] <= 0x0F);
+    }
+
+    #[test]
+    fn test_arithmetic() {
+        // Программа: Vx + Vy, Vx + Vy, Vx - Vy, Vy - Vx
+        let mut em = setup_emulator(&[0x8014, 0x8014, 0x8015, 0x8017]);
+
+        // 10 + 20 = 30, V[0xF] = 0
+        em.v[0] = 10;
+        em.v[1] = 20;
+        em.tick();
+        assert_eq!(em.v[0], 30);
+        assert_eq!(em.v[0xF], 0);
+
+        // 250 + 10 = 4, V[0xF] = 1
+        em.v[0] = 250;
+        em.v[1] = 10;
+        em.tick();
+        assert_eq!(em.v[0], 4);
+        assert_eq!(em.v[0xF], 1);
+
+        // 5 - 10 = 251, V[0xF] = 0
+        em.v[0] = 5;
+        em.v[1] = 10;
+        em.tick();
+        assert_eq!(em.v[0], 251);
+        assert_eq!(em.v[0xF], 0);
+
+        // 10 - 5 = 5, V[0xF] = 1
+        em.v[0] = 5;
+        em.v[1] = 10;
+        em.tick();
+        assert_eq!(em.v[0], 5);
+        assert_eq!(em.v[0xF], 1);
+    }
+
+    #[test]
+    fn test_shifts() {
+        // 8XY6, 8XYE
+        let mut em = setup_emulator(&[0x8016, 0x801E]);
+
+        em.v[0] = 0b0000_1011; // 11 lsb = 1
+        em.v[1] = 0b0000_1010; // 10 lsb = 0
+        em.tick();
+        if IS_SUPER_CHIP {
+            assert_eq!(em.v[0xF], 1);
+            assert_eq!(em.v[0], 0b0000_0101) // после сдвига вправо
+        } else {
+            assert_eq!(em.v[0xF], 0);
+            assert_eq!(em.v[0], 0b0000_0101) // после сдвига вправо
+        }
+
+        em.v[0] = 0b1100_1000; // 200 msb = 1
+        em.v[1] = 0b0110_0100; // 100 msb = 0
+        em.tick();
+        if IS_SUPER_CHIP {
+            assert_eq!(em.v[0xF], 1);
+            assert_eq!(em.v[0], 0b1001_0000) // после сдвига влево
+        } else {
+            assert_eq!(em.v[0xF], 0);
+            assert_eq!(em.v[0], 0b1100_1000) // после сдвига влево
+        }
+    }
+
+    #[test]
+    fn test_provisional_passes() {
+        // 3XNN, 4XNN, 5XY0, 9XY0
+        // 0000 for skip
+        let mut em = setup_emulator(&[0x3016, 0x0000, 0x401E, 0x5010, 0x0000, 0x9010]);
+
+        //for 0x3016
+        em.v[0] = 0x16;
+        let before_tick_pc = em.pc;
+        em.tick();
+        assert_eq!(em.pc - before_tick_pc, 4);
+
+        // for 0x401E
+        em.v[0] = 0x1E;
+        let before_tick_pc = em.pc;
+        em.tick();
+        assert_eq!(em.pc - before_tick_pc, 2);
+
+        // for 0x5010
+        em.v[0] = 0x0001;
+        em.v[1] = 0x0001;
+        let before_tick_pc = em.pc;
+        em.tick();
+        assert_eq!(em.pc - before_tick_pc, 4);
+
+        // for 0x9010
+        em.v[0] = 0x0001;
+        em.v[1] = 0x0001;
+        let before_tick_pc = em.pc;
+        em.tick();
+        assert_eq!(em.pc - before_tick_pc, 2);
+    }
+
+    #[test]
+    fn test_call_return() {
+        // 2NNN, 00EE
+        let mut em = setup_emulator(&[0x2300]);
+
+        let before_call_pc = em.pc;
+        println!("before call: {}", em.pc);
+
+        //Call
+        em.tick();
+        assert_eq!(em.pc, 0x300);
+        assert_eq!(em.stack.sp, 1);
+
+        // 00EE
+        em.memory[0x300] = 0x00;
+        em.memory[0x301] = 0xEE;
+
+        // Return
+        em.tick();
+        assert_eq!(em.pc, before_call_pc + 2);
+        assert_eq!(em.stack.sp, 0);
+    }
+
+    #[test]
+    fn test_rendering() {
+        // DXYN
+        let mut em = setup_emulator(&[0xD012, 0xD012]);
+
+        em.v[0] = 10;
+        em.v[1] = 10;
+        em.tick();
+        assert!(em.screen[10 * SCREEN_WIDTH + 10]);
+        assert!(!em.screen[14 * SCREEN_WIDTH + 10]);
+        assert_eq!(em.v[0xF], 0);
+
+        em.tick();
+        assert_eq!(em.v[0xF], 1);
     }
 }

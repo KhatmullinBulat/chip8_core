@@ -1,7 +1,7 @@
 // стек вызовов
 pub struct Stack {
     data: [u16; 16],
-    sp: u8, // указатель стека
+    pub sp: u8, // указатель стека
 }
 
 impl Stack {
