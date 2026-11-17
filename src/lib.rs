@@ -2,7 +2,11 @@ mod stack;
 
 use stack::Stack;
 
+#[cfg(feature = "SUPER-CHIP")]
 const IS_SUPER_CHIP: bool = true;
+
+#[cfg(not(feature = "SUPER-CHIP"))]
+const IS_SUPER_CHIP: bool = false;
 
 pub const SCREEN_WIDTH: usize = if IS_SUPER_CHIP { 128 } else { 64 };
 pub const SCREEN_HEIGHT: usize = if IS_SUPER_CHIP { 64 } else { 32 };

@@ -3,5 +3,8 @@ name = "chip8_core"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+SUPER-CHIP = []
+
 [dependencies]
 rand = "0.10.3"
